@@ -1,0 +1,53 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+
+# ---- Virtual envs ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Runtime data (專案執行時產生，不該進版控) ----
+uploads/
+results/
+data/
+*.db
+*.db-journal
+
+# ---- YOLO weights (太大，使用者自己下載) ----
+*.pt
+yolov8*.pt
+yolo11*.pt
+
+# ---- Logs ----
+*.log
+logs/
+
+# ---- Notebooks (若加上) ----
+.ipynb_checkpoints/
+
+# ---- Claude Code ----
+.claude/
+
+# ---- OS / 雜檔 ----
+.env
+.env.local
+*.bak

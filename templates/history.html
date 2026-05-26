@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLO::HISTORY — 占用歷史分析</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div class="overlay-scanlines"></div>
+<div class="overlay-noise"></div>
+<div class="overlay-grid"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">▭▭▭</span>
+    <span class="brand-name">YOLO::HISTORY</span>
+    <span class="brand-sub">// occupancy time-series</span>
+  </div>
+  <div class="status">
+    <a href="/" class="back-link">▸ DETECTOR</a>
+    <a href="/annotator" class="back-link">◇ ANNOTATOR</a>
+    <span class="sep">│</span>
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">READY</span>
+    <span class="sep">│</span>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<!-- 工具列：日期範圍 -->
+<div class="toolbar">
+  <div class="toolbar-section">
+    <span class="tb-label">RANGE</span>
+    <button class="tb-btn active" data-preset="1h">1H</button>
+    <button class="tb-btn" data-preset="6h">6H</button>
+    <button class="tb-btn" data-preset="24h">24H</button>
+    <button class="tb-btn" data-preset="7d">7D</button>
+    <button class="tb-btn" data-preset="30d">30D</button>
+    <button class="tb-btn" data-preset="all">ALL</button>
+  </div>
+  <div class="toolbar-section toolbar-custom">
+    <span class="tb-label">FROM</span>
+    <input type="datetime-local" id="start-input">
+    <span class="tb-label">TO</span>
+    <input type="datetime-local" id="end-input">
+    <button class="tb-btn" id="btn-apply">APPLY</button>
+  </div>
+  <div class="toolbar-section" style="margin-left:auto;">
+    <button class="tb-btn" id="btn-refresh">↻ REFRESH</button>
+    <button class="tb-btn" id="btn-csv">⬇ CSV</button>
+    <button class="tb-btn tb-danger" id="btn-clear-old">⌫ CLEAR &lt;7D</button>
+  </div>
+</div>
+
+<main class="history-main">
+
+  <!-- KPI 條 -->
+  <section class="kpi-strip" id="kpi-strip">
+    <div class="kpi-card">
+      <span class="kpi-card-label">SAMPLES</span>
+      <span class="kpi-card-value" id="kpi-samples">—</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-card-label">AVG OCC</span>
+      <span class="kpi-card-value" id="kpi-avg-rate">—</span>
+    </div>
+    <div class="kpi-card kpi-accent">
+      <span class="kpi-card-label">PEAK OCC</span>
+      <span class="kpi-card-value" id="kpi-max-rate">—</span>
+      <span class="kpi-card-sub" id="kpi-peak-time">—</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-card-label">MAX PERSONS</span>
+      <span class="kpi-card-value" id="kpi-max-persons">—</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-card-label">LATEST</span>
+      <span class="kpi-card-value" id="kpi-latest">—</span>
+      <span class="kpi-card-sub" id="kpi-latest-time">—</span>
+    </div>
+  </section>
+
+  <!-- 主圖：時間序列 -->
+  <section class="panel chart-panel">
+    <div class="panel-header">
+      <span class="ph-num">01</span>
+      <span class="ph-title">OCCUPANCY TIMELINE</span>
+      <span class="ph-meta" id="ts-meta">—</span>
+    </div>
+    <div class="panel-body chart-body">
+      <canvas id="chart-timeseries"></canvas>
+      <div class="chart-empty" id="ts-empty">尚無資料 — 開啟偵測器並設定 ROI 後將自動累積</div>
+    </div>
+  </section>
+
+  <!-- 雙圖：每座位 / 小時 -->
+  <div class="dual-charts">
+    <section class="panel chart-panel">
+      <div class="panel-header">
+        <span class="ph-num">02</span>
+        <span class="ph-title">SEAT OCCUPANCY RANK</span>
+      </div>
+      <div class="panel-body chart-body small">
+        <canvas id="chart-by-seat"></canvas>
+        <div class="chart-empty" id="seat-empty">尚無座位資料</div>
+      </div>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="panel-header">
+        <span class="ph-num">03</span>
+        <span class="ph-title">HOURLY PATTERN</span>
+        <span class="ph-meta">24h aggregate</span>
+      </div>
+      <div class="panel-body chart-body small">
+        <canvas id="chart-hourly"></canvas>
+      </div>
+    </section>
+  </div>
+
+  <!-- 最近紀錄表 -->
+  <section class="panel">
+    <div class="panel-header">
+      <span class="ph-num">04</span>
+      <span class="ph-title">RECENT EVENTS</span>
+      <span class="ph-meta" id="recent-meta">last 20</span>
+    </div>
+    <div class="panel-body">
+      <table class="data-table" id="recent-table">
+        <thead>
+          <tr>
+            <th>TS</th><th>MODEL</th><th>PERSONS</th>
+            <th>SEATS</th><th>OCC</th><th>VAC</th><th>RATE</th><th>ID</th>
+          </tr>
+        </thead>
+        <tbody id="recent-tbody">
+          <tr><td colspan="8" class="placeholder">— no data —</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <span>SQLite at data/history.db · 1 row per inference (only when ROIs defined)</span>
+  <span class="sep">│</span>
+  <span>opt-out per request: POST /api/detect?nolog=1</span>
+</footer>
+
+<script src="{{ url_for('static', filename='history.js') }}"></script>
+</body>
+</html>

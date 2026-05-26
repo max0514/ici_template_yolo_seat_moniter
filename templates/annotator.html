@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLO::ANNOTATE — 座位 ROI 標註</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="overlay-scanlines"></div>
+<div class="overlay-noise"></div>
+<div class="overlay-grid"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◇◆◇</span>
+    <span class="brand-name">YOLO::ANNOTATE</span>
+    <span class="brand-sub">// seat ROI editor</span>
+  </div>
+  <div class="status">
+    <a href="/" class="back-link">▸ DETECTOR</a>
+    <a href="/history" class="back-link">▭ HISTORY</a>
+    <span class="sep">│</span>
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">READY</span>
+  </div>
+</header>
+
+<main class="main annotator-main">
+
+  <!-- 左側：操作與座位清單 -->
+  <aside class="panel panel-side">
+    <div class="panel-header">
+      <span class="ph-num">01</span>
+      <span class="ph-title">REFERENCE</span>
+    </div>
+    <div class="panel-body">
+      <label class="btn btn-secondary" for="ref-input" style="cursor:pointer;">
+        ⬆ UPLOAD IMAGE
+      </label>
+      <input type="file" id="ref-input" accept="image/*" hidden>
+      <p class="hint" id="ref-info">尚未上傳參考影像</p>
+    </div>
+
+    <div class="panel-header">
+      <span class="ph-num">02</span>
+      <span class="ph-title">HOW TO</span>
+    </div>
+    <div class="panel-body kbd-help">
+      <div class="kbd-row"><kbd>CLICK</kbd><span>新增多邊形頂點</span></div>
+      <div class="kbd-row"><kbd>DBL</kbd><span>結束目前多邊形</span></div>
+      <div class="kbd-row"><kbd>ENTER</kbd><span>結束多邊形</span></div>
+      <div class="kbd-row"><kbd>ESC</kbd><span>取消當前繪製</span></div>
+      <div class="kbd-row"><kbd>DEL</kbd><span>刪除選取座位</span></div>
+      <div class="kbd-row"><kbd>SHIFT</kbd><span>拖曳已存頂點</span></div>
+    </div>
+
+    <div class="panel-header">
+      <span class="ph-num">03</span>
+      <span class="ph-title">SEATS · <span id="seats-count">0</span></span>
+    </div>
+    <div class="panel-body">
+      <div class="seat-list" id="seat-list">
+        <div class="placeholder">— 尚未標註任何座位 —</div>
+      </div>
+
+      <div class="config-row" style="margin-top:14px;">
+        <label>OCC THRESHOLD <span class="val" id="thr-val">0.15</span></label>
+        <input type="range" id="thr-slider" min="0.05" max="0.60" step="0.05" value="0.15">
+      </div>
+
+      <div style="display:flex; gap:6px; margin-top:12px;">
+        <button class="btn btn-secondary" id="btn-clear" style="flex:1;">⌫ CLEAR ALL</button>
+        <button class="btn btn-primary" id="btn-save" style="flex:1;">⬇ SAVE</button>
+      </div>
+      <p class="hint" id="save-status">尚未儲存</p>
+    </div>
+  </aside>
+
+  <!-- 中間：標註畫布 -->
+  <section class="panel panel-canvas">
+    <div class="panel-header">
+      <span class="ph-num">CANVAS</span>
+      <span class="ph-title">ANNOTATION SURFACE</span>
+      <span class="ph-meta" id="canvas-meta">—</span>
+    </div>
+    <div class="panel-body canvas-body">
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="canvas"></canvas>
+        <div class="canvas-empty annotator-empty" id="empty-hint">
+          <div class="crosshair">
+            <span class="ch-h"></span><span class="ch-v"></span>
+            <span class="corner tl"></span><span class="corner tr"></span>
+            <span class="corner bl"></span><span class="corner br"></span>
+          </div>
+          <p>NO REFERENCE IMAGE</p>
+          <small>左側上傳一張圖書館或場景參考影像</small>
+        </div>
+        <div class="draw-status" id="draw-status"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <span>SEAT OCCUPANCY = (PERSON_BBOX ∩ SEAT_POLYGON) / SEAT_AREA  ≥  THRESHOLD</span>
+</footer>
+
+<script src="{{ url_for('static', filename='annotator.js') }}"></script>
+</body>
+</html>

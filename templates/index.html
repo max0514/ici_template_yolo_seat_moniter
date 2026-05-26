@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLO::DETECT — 物件偵測終端機</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<!-- 掃描線 + 雜訊覆蓋層 -->
+<div class="overlay-scanlines"></div>
+<div class="overlay-noise"></div>
+<div class="overlay-grid"></div>
+
+<!-- 頂部狀態列 -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">▰▰▰</span>
+    <span class="brand-name">YOLO::DETECT</span>
+    <span class="brand-sub">// inference terminal v1.0</span>
+  </div>
+  <div class="status">
+    <a href="/annotator" class="back-link">◇ ANNOTATE</a>
+    <a href="/history" class="back-link">▭ HISTORY</a>
+    <span class="sep">│</span>
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">READY</span>
+    <span class="sep">│</span>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<main class="main">
+
+  <!-- 左側：輸入控制 -->
+  <section class="panel panel-input">
+    <div class="panel-header">
+      <span class="ph-num">01</span>
+      <span class="ph-title">INPUT / CONFIG</span>
+    </div>
+
+    <div class="panel-body">
+
+      <!-- Tab 切換 -->
+      <div class="tabs">
+        <button class="tab active" data-tab="upload">▸ UPLOAD</button>
+        <button class="tab" data-tab="camera">▸ WEBCAM</button>
+      </div>
+
+      <!-- 上傳區 -->
+      <div class="tab-panel active" id="tab-upload">
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file-input" accept="image/*" hidden>
+          <div class="dz-icon">⬢</div>
+          <div class="dz-text">
+            <strong>DROP IMAGE</strong>
+            <span>或點擊選擇檔案</span>
+            <small>支援 JPG / PNG / WEBP · 上限 16MB</small>
+          </div>
+        </label>
+        <button class="btn btn-primary" id="btn-detect" disabled>
+          <span>▶ RUN INFERENCE</span>
+        </button>
+      </div>
+
+      <!-- Webcam 區 -->
+      <div class="tab-panel" id="tab-camera">
+        <div class="webcam-wrap">
+          <video id="webcam" autoplay muted playsinline></video>
+          <div class="webcam-overlay" id="webcam-overlay">CAMERA OFF</div>
+        </div>
+        <div class="webcam-controls">
+          <button class="btn btn-secondary" id="btn-cam-start">▶ START</button>
+          <button class="btn btn-secondary" id="btn-cam-stop" disabled>■ STOP</button>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="live-mode">
+          <span>LIVE 偵測 (每 1.5s)</span>
+        </label>
+      </div>
+
+      <!-- 參數區 -->
+      <div class="config">
+        <div class="config-row">
+          <label>MODEL</label>
+          <select id="model-select">
+            {% for m in models %}
+            <option value="{{ m }}" {% if m == 'nano' %}selected{% endif %}>{{ m | upper }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="config-row">
+          <label>CONF <span class="val" id="conf-val">0.25</span></label>
+          <input type="range" id="conf-slider" min="0.05" max="0.95" step="0.05" value="0.25">
+        </div>
+
+        <div class="config-row">
+          <label>IOU <span class="val" id="iou-val">0.45</span></label>
+          <input type="range" id="iou-slider" min="0.1" max="0.9" step="0.05" value="0.45">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 中間：影像輸出 -->
+  <section class="panel panel-canvas">
+    <div class="panel-header">
+      <span class="ph-num">02</span>
+      <span class="ph-title">DETECTION OUTPUT</span>
+      <span class="ph-meta" id="output-meta">—</span>
+    </div>
+    <div class="panel-body canvas-body">
+      <div class="canvas-frame" id="canvas-frame">
+        <div class="canvas-empty">
+          <div class="crosshair">
+            <span class="ch-h"></span><span class="ch-v"></span>
+            <span class="corner tl"></span><span class="corner tr"></span>
+            <span class="corner bl"></span><span class="corner br"></span>
+          </div>
+          <p>WAITING FOR INPUT</p>
+          <small>上傳圖片或開啟攝影機開始偵測</small>
+        </div>
+        <img id="result-img" alt="">
+      </div>
+      <div class="canvas-footer">
+        <button class="btn btn-ghost" id="btn-download" disabled>⬇ DOWNLOAD</button>
+        <span class="footer-info" id="footer-info"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右側：統計 -->
+  <section class="panel panel-stats">
+    <div class="panel-header">
+      <span class="ph-num">03</span>
+      <span class="ph-title">ANALYTICS</span>
+    </div>
+    <div class="panel-body stats-body">
+
+      <!-- KPI：依是否有 ROI 自動切換 -->
+      <div class="kpi-grid" id="kpi-grid">
+        <div class="kpi">
+          <span class="kpi-label">PERSONS</span>
+          <span class="kpi-value" id="kpi-persons">—</span>
+        </div>
+        <div class="kpi" id="kpi-cell-2">
+          <span class="kpi-label" id="kpi-label-2">CHAIRS</span>
+          <span class="kpi-value" id="kpi-2">—</span>
+        </div>
+        <div class="kpi kpi-accent" id="kpi-cell-3">
+          <span class="kpi-label" id="kpi-label-3">VACANT (est.)</span>
+          <span class="kpi-value" id="kpi-3">—</span>
+        </div>
+        <div class="kpi" id="kpi-cell-4">
+          <span class="kpi-label" id="kpi-label-4">TOTAL DETECT</span>
+          <span class="kpi-value" id="kpi-4">—</span>
+        </div>
+      </div>
+
+      <!-- 座位地圖（只在有 ROI 時出現） -->
+      <div id="seat-map-wrap" style="display:none;">
+        <div class="section-title">
+          <span>SEAT MAP · <span id="seat-map-info">—</span></span>
+          <span class="line"></span>
+        </div>
+        <div class="seat-grid" id="seat-grid"></div>
+      </div>
+
+      <!-- 沒有 ROI 時的提示 -->
+      <div id="no-roi-hint" class="no-roi-hint">
+        <span>SEAT ROI · 尚未設定</span>
+        <a href="/annotator" class="btn btn-ghost" style="margin-top:6px;">◇ 開啟標註器</a>
+      </div>
+
+      <!-- 類別分布 -->
+      <div class="section-title">
+        <span>CLASS DISTRIBUTION</span>
+        <span class="line"></span>
+      </div>
+      <div class="class-list" id="class-list">
+        <div class="placeholder">— no data —</div>
+      </div>
+
+      <!-- 偵測明細 (前 10) -->
+      <div class="section-title">
+        <span>DETECTIONS LOG</span>
+        <span class="line"></span>
+      </div>
+      <div class="log" id="log">
+        <div class="log-line">$ awaiting inference...</div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <span>YOLOv8 · COCO 80 classes · Ultralytics</span>
+  <span class="sep">│</span>
+  <span>BUILT FOR LIBRARY SEAT MONITORING</span>
+  <span class="sep">│</span>
+  <span>ESP32-CAM compatible via /api/detect</span>
+</footer>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
