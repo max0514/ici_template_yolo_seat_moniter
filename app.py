@@ -22,6 +22,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import requests as http_requests
 from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
 from PIL import Image
 from ultralytics import YOLO
@@ -50,7 +51,83 @@ AVAILABLE_MODELS = {
 }
 
 LIBRARY_FOCUS = {"person", "chair", "couch", "dining table", "laptop", "book", "backpack"}
+OCCUPANCY_CLASSES = {"person", "laptop"}
+BELONGING_CLASSES = {"laptop", "backpack", "book", "handbag", "suitcase", "cell phone"}
 DEFAULT_OCCUPANCY_THRESHOLD = 0.15  # 人 bbox ∩ 座位 / 座位面積 ≥ 0.15 視為佔用
+AWAY_FLAG_SECONDS = 3600  # 1 hour before flagging as illegal occupation
+
+# ---------- Seat State Tracker ----------
+# States: "vacant" / "occupied" / "away" / "flagged"
+#   vacant   – no person, no belongings
+#   occupied – person detected at seat
+#   away     – person left but belongings remain (timer starts)
+#   flagged  – belongings left for > AWAY_FLAG_SECONDS without person returning
+
+class SeatTracker:
+    """Track per-seat state across detection frames."""
+    def __init__(self):
+        self._seats = {}   # seat_id -> { state, person_left_at, belongings, last_seen_person }
+
+    def _ensure(self, seat_id):
+        if seat_id not in self._seats:
+            self._seats[seat_id] = {
+                "state": "vacant",
+                "person_left_at": None,
+                "belongings": [],
+                "last_seen_person": None,
+            }
+        return self._seats[seat_id]
+
+    def update(self, seat_id, has_person, belongings_found):
+        """Update seat state based on current detection frame."""
+        s = self._ensure(seat_id)
+        now = datetime.now()
+
+        if has_person:
+            # Person is present → occupied, reset departure timer
+            s["state"] = "occupied"
+            s["person_left_at"] = None
+            s["belongings"] = belongings_found
+            s["last_seen_person"] = now
+        elif belongings_found:
+            # No person but belongings detected
+            if s["state"] == "occupied":
+                # Person just left
+                s["state"] = "away"
+                s["person_left_at"] = now
+            elif s["state"] in ("away", "flagged"):
+                # Still away – check if we should flag
+                if s["person_left_at"]:
+                    elapsed = (now - s["person_left_at"]).total_seconds()
+                    if elapsed >= AWAY_FLAG_SECONDS:
+                        s["state"] = "flagged"
+                else:
+                    s["person_left_at"] = now
+            else:
+                # Was vacant, now belongings appeared without person
+                s["state"] = "away"
+                s["person_left_at"] = now
+            s["belongings"] = belongings_found
+        else:
+            # No person, no belongings → vacant
+            s["state"] = "vacant"
+            s["person_left_at"] = None
+            s["belongings"] = []
+
+    def get(self, seat_id):
+        s = self._ensure(seat_id)
+        now = datetime.now()
+        away_seconds = None
+        if s["person_left_at"] and s["state"] in ("away", "flagged"):
+            away_seconds = round((now - s["person_left_at"]).total_seconds())
+        return {
+            "state": s["state"],
+            "away_seconds": away_seconds,
+            "belongings": s["belongings"],
+        }
+
+seat_tracker = SeatTracker()
+
 
 # ---------- 模型快取 ----------
 _model_cache: dict[str, YOLO] = {}
@@ -181,14 +258,14 @@ def scaled_rois(rois: dict[str, Any], target_w: int, target_h: int) -> dict[str,
 # ---------- 座位佔用計算 ----------
 def compute_seat_status(detections, rois, image_shape):
     """
-    對每個座位 polygon，找出與 person bbox 的覆蓋率最高者；
-    覆蓋率 = (person_bbox ∩ seat_polygon) / seat_polygon_area
+    For each seat polygon, check overlap with person bboxes and belonging bboxes.
+    Also update the global seat_tracker for time-based state tracking.
     """
     h, w = image_shape[:2]
     threshold = rois.get("occupancy_threshold", DEFAULT_OCCUPANCY_THRESHOLD)
     person_dets = [d for d in detections if d["class"] == "person"]
+    belonging_dets = [d for d in detections if d["class"] in BELONGING_CLASSES]
 
-    # 預先建立每張座位 mask（O(W*H) 一次）
     seat_data = []
     for seat in rois.get("seats", []):
         poly_np = np.array(seat["polygon"], dtype=np.int32)
@@ -199,28 +276,58 @@ def compute_seat_status(detections, rois, image_shape):
         area = int(mask.sum())
         seat_data.append((seat, mask, area))
 
-    status_list = []
-    for seat, seat_mask, seat_area in seat_data:
-        best_cov = 0.0
-        best_p = None
+    def best_overlap(dets_list, seat_mask, seat_area):
+        best_cov, best_d = 0.0, None
         if seat_area > 0:
-            for p in person_dets:
-                x1, y1, x2, y2 = p["box"]
-                px1 = max(0, int(x1)); py1 = max(0, int(y1))
-                px2 = min(w, int(x2)); py2 = min(h, int(y2))
+            for d in dets_list:
+                x1, y1, x2, y2 = d["box"]
+                px1, py1 = max(0, int(x1)), max(0, int(y1))
+                px2, py2 = min(w, int(x2)), min(h, int(y2))
                 if px1 >= px2 or py1 >= py2:
                     continue
                 inter = int(seat_mask[py1:py2, px1:px2].sum())
                 cov = inter / seat_area
                 if cov > best_cov:
-                    best_cov = cov
-                    best_p = p
+                    best_cov, best_d = cov, d
+        return best_cov, best_d
+
+    def find_all_belongings(seat_mask, seat_area):
+        found = []
+        if seat_area <= 0:
+            return found
+        for d in belonging_dets:
+            x1, y1, x2, y2 = d["box"]
+            px1, py1 = max(0, int(x1)), max(0, int(y1))
+            px2, py2 = min(w, int(x2)), min(h, int(y2))
+            if px1 >= px2 or py1 >= py2:
+                continue
+            inter = int(seat_mask[py1:py2, px1:px2].sum())
+            cov = inter / seat_area
+            if cov >= threshold:
+                found.append(d["class"])
+        return list(set(found))
+
+    status_list = []
+    for seat, seat_mask, seat_area in seat_data:
+        person_cov, person_det = best_overlap(person_dets, seat_mask, seat_area)
+        has_person = person_cov >= threshold
+        belongings_found = find_all_belongings(seat_mask, seat_area)
+
+        # Update time-based state tracker
+        seat_tracker.update(seat["id"], has_person, belongings_found)
+        tracked = seat_tracker.get(seat["id"])
+
         status_list.append({
             "id": seat["id"],
             "label": seat.get("label", seat["id"]),
-            "occupied": best_cov >= threshold,
-            "coverage": round(best_cov, 4),
-            "person_confidence": round(best_p["confidence"], 4) if best_p else 0.0,
+            "occupied": has_person or bool(belongings_found),
+            "has_person": has_person,
+            "coverage": round(person_cov, 4),
+            "matched_class": person_det["class"] if person_det else None,
+            "person_confidence": round(person_det["confidence"], 4) if person_det else 0.0,
+            "belongings": belongings_found,
+            "state": tracked["state"],
+            "away_seconds": tracked["away_seconds"],
         })
     return status_list
 
@@ -271,6 +378,9 @@ def draw_seat_overlay(image_bgr, rois, seat_status):
     return blended
 
 # ---------- 推論 ----------
+RELEVANT_CLASSES = {"person", "laptop", "dining table", "chair", "couch",
+                     "backpack", "book", "handbag", "suitcase", "cell phone"}
+
 def run_inference(image_bgr, model_name, conf, iou, apply_rois=True):
     model = get_model(model_name)
     t0 = time.perf_counter()
@@ -278,7 +388,6 @@ def run_inference(image_bgr, model_name, conf, iou, apply_rois=True):
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     r = results[0]
-    annotated_bgr = r.plot()
     names = r.names
 
     detections, stats = [], {}
@@ -294,6 +403,19 @@ def run_inference(image_bgr, model_name, conf, iou, apply_rois=True):
                 "box": [round(v, 1) for v in xyxy],
             })
             stats[cls_name] = stats.get(cls_name, 0) + 1
+
+    annotated_bgr = image_bgr.copy()
+    for d in detections:
+        if d["class"] not in RELEVANT_CLASSES:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in d["box"]]
+        color = (0, 255, 0) if d["class"] == "person" else (255, 180, 0)
+        cv2.rectangle(annotated_bgr, (x1, y1), (x2, y2), color, 2)
+        label = f'{d["class"]} {d["confidence"]:.2f}'
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(annotated_bgr, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(annotated_bgr, label, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
     # 座位狀態
     seat_status = []
@@ -331,6 +453,10 @@ def bgr_to_data_url(image_bgr, fmt="jpeg", quality=90) -> str:
 @app.route("/")
 def index():
     return render_template("index.html", models=list(AVAILABLE_MODELS.keys()))
+
+@app.route("/dashboard")
+def dashboard():
+    return render_template("dashboard.html")
 
 @app.route("/annotator")
 def annotator():
@@ -561,6 +687,86 @@ def api_detect():
                 vacant=vacant,
                 occ_rate=occupancy_rate,
                 result_id=result_id,
+                seat_status=seat_status,
+            )
+        except Exception as e:
+            print(f"[DB] log failed: {e}")
+
+    return jsonify({
+        "result_id": result_id,
+        "model": model_name,
+        "elapsed_ms": round(elapsed_ms, 1),
+        "image_shape": list(image_bgr.shape),
+        "num_detections": len(detections),
+        "detections": detections,
+        "stats": stats,
+        "library": {
+            "focus_stats": focus_stats,
+            "persons": persons,
+            "chairs_or_couches": chairs,
+            "estimated_vacant_seats": estimated_vacant_fallback,
+        },
+        "seats": {
+            "defined": total_seats > 0,
+            "total": total_seats,
+            "occupied": occupied,
+            "vacant": vacant,
+            "occupancy_rate": occupancy_rate,
+            "threshold": rois_used["occupancy_threshold"] if rois_used else None,
+            "status": seat_status,
+        },
+        "annotated_image": bgr_to_data_url(annotated_bgr),
+    })
+
+
+# ---------- Routes: ESP32-CAM capture + detect ----------
+@app.route("/api/capture-detect", methods=["POST"])
+def api_capture_detect():
+    body = request.get_json(silent=True) or {}
+    url = body.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    model_name = body.get("model", "nano")
+    conf = float(body.get("conf", 0.25))
+    iou = float(body.get("iou", 0.45))
+
+    try:
+        resp = http_requests.get(url, timeout=8)
+        resp.raise_for_status()
+        arr = np.frombuffer(resp.content, dtype=np.uint8)
+        image_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image_bgr is None:
+            return jsonify({"error": "Failed to decode image from camera"}), 400
+    except http_requests.RequestException as e:
+        return jsonify({"error": f"Camera fetch failed: {e}"}), 502
+
+    try:
+        annotated_bgr, detections, stats, elapsed_ms, seat_status, rois_used = run_inference(
+            image_bgr, model_name, conf, iou, apply_rois=True
+        )
+    except Exception as e:
+        return jsonify({"error": f"Inference failed: {e}"}), 500
+
+    persons = stats.get("person", 0)
+    chairs = stats.get("chair", 0) + stats.get("couch", 0)
+    focus_stats = {k: v for k, v in stats.items() if k in LIBRARY_FOCUS}
+    total_seats = len(seat_status)
+    occupied = sum(1 for s in seat_status if s["occupied"])
+    vacant = total_seats - occupied
+    occupancy_rate = round(occupied / total_seats, 4) if total_seats > 0 else None
+    estimated_vacant_fallback = max(chairs - persons, 0) if chairs > 0 else None
+
+    result_id = uuid.uuid4().hex[:12]
+    cv2.imwrite(str(RESULT_DIR / f"{result_id}.jpg"), annotated_bgr)
+
+    if total_seats > 0:
+        try:
+            log_detection_to_db(
+                model=model_name, num_detections=len(detections),
+                persons=persons, total_seats=total_seats,
+                occupied=occupied, vacant=vacant,
+                occ_rate=occupancy_rate, result_id=result_id,
                 seat_status=seat_status,
             )
         except Exception as e:
