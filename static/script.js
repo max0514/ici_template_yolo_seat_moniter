@@ -316,7 +316,7 @@ function startLiveLoop() {
     );
   };
   tick();
-  state.liveTimer = setInterval(tick, 1500);
+  state.liveTimer = setInterval(tick, 50);
 }
 
 function stopLiveLoop() {

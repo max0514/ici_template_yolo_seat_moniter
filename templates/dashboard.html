@@ -639,7 +639,7 @@ $('btn-live').onclick = () => {
   log('Live started');
   const tick = () => { if (!busy) capture(true); };
   tick();
-  liveTimer = setInterval(tick, 2000);
+  liveTimer = setInterval(tick, 50);
   $('btn-live').disabled = true;
   $('btn-live').classList.add('active');
   $('btn-stop').disabled = false;
