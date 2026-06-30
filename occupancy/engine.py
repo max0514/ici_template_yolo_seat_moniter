@@ -115,6 +115,14 @@ class OccupancyEngine:
     def flag_threshold(self) -> float:
         return self._T_flag
 
+    def forget_seat(self, seat_id: str) -> None:
+        """Drop internal tracker state for a seat that no longer exists.
+
+        Additive helper for callers that manage a dynamic, persistent set of
+        seats (e.g. auto-detection). Safe no-op if the seat is unknown.
+        """
+        self._trackers.pop(seat_id, None)
+
     def update(self, detections: list[Detection], roi_set: list[Seat],
                now: float) -> list[SeatState]:
         """Evaluate one frame. Returns current state for every seat in roi_set."""
@@ -178,6 +186,8 @@ class OccupancyEngine:
             self._from_away(tk, belongings, now)
         elif tk.status == Status.FLAGGED:
             self._from_flagged(tk, belongings, now)
+        elif tk.status == Status.ILLEGAL:
+            self._from_illegal(tk, belongings, now)
         elif tk.status == Status.UNKNOWN:
             self._from_unknown(tk, has_person, belongings, now)
 
@@ -234,6 +244,28 @@ class OccupancyEngine:
             tk.confidence = 0.9
 
     def _from_flagged(self, tk: _Tracker, belongings: tuple[str, ...],
+                      now: float) -> None:
+        if belongings:
+            tk.belongings = belongings
+        if tk.pos_count >= self._k_occ:
+            tk.status = Status.OCCUPIED
+            tk.since_ts = now
+            tk.person_left_ts = None
+            tk.belongings = ()
+            tk.confidence = 1.0
+        elif tk.neg_count >= self._k_emp:
+            tk.status = Status.EMPTY
+            tk.since_ts = now
+            tk.person_left_ts = None
+            tk.belongings = ()
+            tk.confidence = 0.9
+        elif tk.person_left_ts is not None and \
+             (now - tk.person_left_ts) >= 2 * self._T_flag:
+            tk.status = Status.ILLEGAL
+            tk.since_ts = now
+            tk.confidence = 1.0
+
+    def _from_illegal(self, tk: _Tracker, belongings: tuple[str, ...],
                       now: float) -> None:
         if belongings:
             tk.belongings = belongings

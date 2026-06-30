@@ -76,7 +76,9 @@ def save_config(config: dict) -> None:
         json.dump(config, f, indent=2)
 
 _config = load_config()
-occupancy_engine = OccupancyEngine(T_flag=_config.get("T_flag", 3600))
+# T_empty kept short so a chair releases quickly once the person leaves —
+# avoids many chairs latching OCCUPIED as people move through frame.
+occupancy_engine = OccupancyEngine(T_flag=_config.get("T_flag", 3600), T_empty=4.0)
 
 
 # ---------- 模型快取 ----------
@@ -252,13 +254,13 @@ def compute_seat_status(detections, rois, image_shape):
     status_list = []
     for ss in seat_states:
         away_seconds = None
-        if ss.person_left_ts is not None and ss.status in (Status.AWAY, Status.FLAGGED):
+        if ss.person_left_ts is not None and ss.status in (Status.AWAY, Status.FLAGGED, Status.ILLEGAL):
             away_seconds = round(now - ss.person_left_ts)
         status_list.append({
             "id": ss.seat_id,
             "label": next((s.get("label", s["id"]) for s in rois.get("seats", [])
                           if s["id"] == ss.seat_id), ss.seat_id),
-            "occupied": ss.status in (Status.OCCUPIED, Status.AWAY, Status.FLAGGED),
+            "occupied": ss.status == Status.OCCUPIED,
             "has_person": ss.status == Status.OCCUPIED,
             "coverage": round(ss.confidence, 4),
             "matched_class": "person" if ss.status == Status.OCCUPIED else None,
@@ -315,69 +317,181 @@ def draw_seat_overlay(image_bgr, rois, seat_status):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (10, 14, 12), 1, cv2.LINE_AA)
     return blended
 
-# ---------- Auto-detect seats from YOLO chair/table detections ----------
+# ---------- Auto-detect seats (persistent anchors) ----------
+class SeatRegistry:
+    """Persistent set of seat anchors derived from YOLO detections.
+
+    Seats are anchored to a fixed image location once established (from a chair
+    or a person) and PERSIST across frames — even after the person leaves. This
+    is what lets a lingering laptop hold a seat in AWAY -> FLAGGED -> ILLEGAL.
+    Without persistence, person-derived seats vanish the instant the person is
+    no longer detected, so those states could never trigger.
+    """
+
+    MATCH_OVERLAP = 0.30   # min box overlap (∩ / min-area) to treat as the same seat
+    MERGE_OVERLAP = 0.55   # anchors overlapping more than this are collapsed into one
+    PRUNE_AFTER = 12.0     # seconds an anchor may stay continuously EMPTY before removal
+
+    def __init__(self) -> None:
+        self._anchors: dict[str, dict] = {}   # uid -> {box, kind, num, label, last_nonempty}
+        self._uid = 1
+
+    @staticmethod
+    def _center(box):
+        return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+
+    @staticmethod
+    def _overlap(a, b):
+        """Intersection area over the smaller box's area (0~1)."""
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        m = min(area_a, area_b)
+        return inter / m if m > 0 else 0.0
+
+    def _match(self, box):
+        """Find the existing anchor with the largest overlap above threshold."""
+        best, best_o = None, self.MATCH_OVERLAP
+        for aid, a in self._anchors.items():
+            o = self._overlap(box, a["box"])
+            if o > best_o:
+                best, best_o = aid, o
+        return best
+
+    def _create(self, box, kind, now):
+        used = {a["num"] for a in self._anchors.values()}
+        num = 1
+        while num in used:
+            num += 1
+        aid = f"seat-{self._uid}"
+        self._uid += 1
+        self._anchors[aid] = {"box": box, "kind": kind, "num": num,
+                              "label": f"Seat {num}", "last_nonempty": now}
+        return aid
+
+    def update(self, detections, image_shape, now, engine):
+        h, w = image_shape[:2]
+
+        def norm_box(det, pad):
+            x1, y1, x2, y2 = det["box"]
+            dx, dy = (x2 - x1) * pad, (y2 - y1) * pad
+            return (max(0, x1 - dx) / w, max(0, y1 - dy) / h,
+                    min(w, x2 + dx) / w, min(h, y2 + dy) / h)
+
+        chairs = [d for d in detections if d["class"] in ("chair", "couch")]
+        persons = [d for d in detections if d["class"] == "person"]
+
+        # Chairs first — stable physical anchors that define a seat location.
+        for d in chairs:
+            box = norm_box(d, 0.15)
+            aid = self._match(box)
+            if aid is None:
+                self._create(box, "chair", now)
+            else:
+                self._anchors[aid]["box"] = box
+                self._anchors[aid]["kind"] = "chair"
+        # Persons bind to the chair they overlap; only create a seat if none.
+        for d in persons:
+            box = norm_box(d, 0.30)
+            aid = self._match(box)
+            if aid is None:
+                self._create(box, "person", now)
+            elif self._anchors[aid]["kind"] != "chair":
+                self._anchors[aid]["box"] = box  # follow person-derived anchors only
+
+        # Merge pass: collapse anchors that ended up overlapping (keeps oldest).
+        ids = list(self._anchors.keys())
+        for i in range(len(ids)):
+            ai = ids[i]
+            if ai not in self._anchors:
+                continue
+            for j in range(i + 1, len(ids)):
+                aj = ids[j]
+                if aj not in self._anchors:
+                    continue
+                if self._overlap(self._anchors[ai]["box"], self._anchors[aj]["box"]) > self.MERGE_OVERLAP:
+                    drop = ai if self._anchors[ai]["num"] > self._anchors[aj]["num"] else aj
+                    self._anchors.pop(drop, None)
+                    engine.forget_seat(drop)
+                    if drop == ai:
+                        break
+
+        if not self._anchors:
+            return []
+
+        # Build seats from ALL anchors (persistent), feed every detection in.
+        schema_seats = [
+            SchemaSeat(
+                id=aid, label=a["label"], zone="main",
+                roi_polygon=[(a["box"][0], a["box"][1]), (a["box"][2], a["box"][1]),
+                             (a["box"][2], a["box"][3]), (a["box"][0], a["box"][3])],
+            )
+            for aid, a in self._anchors.items()
+        ]
+        schema_dets = [
+            SchemaDetection(
+                bbox=(d["box"][0] / w, d["box"][1] / h, d["box"][2] / w, d["box"][3] / h),
+                confidence=d["confidence"], cls=d["class"], frame_ts=now,
+            )
+            for d in detections
+        ]
+
+        seat_states = engine.update(schema_dets, schema_seats, now)
+
+        status_list, to_prune = [], []
+        for ss in seat_states:
+            a = self._anchors.get(ss.seat_id)
+            if a is None:
+                continue
+            if ss.status != Status.EMPTY:
+                a["last_nonempty"] = now
+            elif now - a["last_nonempty"] > self.PRUNE_AFTER:
+                to_prune.append(ss.seat_id)
+                continue
+
+            away_sec = None
+            if ss.person_left_ts and ss.status in (Status.AWAY, Status.FLAGGED, Status.ILLEGAL):
+                away_sec = round(now - ss.person_left_ts)
+            status_list.append({
+                "id": ss.seat_id,
+                "label": a["label"],
+                "_x": self._center(a["box"])[0],
+                "occupied": ss.status == Status.OCCUPIED,
+                "has_person": ss.status == Status.OCCUPIED,
+                "coverage": round(ss.confidence, 4),
+                "matched_class": "person" if ss.status == Status.OCCUPIED else None,
+                "person_confidence": round(ss.confidence, 4),
+                "belongings": list(ss.belongings),
+                "state": ss.status.value,
+                "away_seconds": away_sec,
+            })
+
+        for aid in to_prune:
+            self._anchors.pop(aid, None)
+            engine.forget_seat(aid)
+
+        # Stable left-to-right ordering for the UI
+        status_list.sort(key=lambda s: s["_x"])
+        for s in status_list:
+            del s["_x"]
+        return status_list
+
+
+seat_registry = SeatRegistry()
+
+
 def auto_detect_seats(detections, image_shape):
-    """When no ROIs defined, use detected chairs as dynamic seats.
+    """Persistent seat detection. Seats survive the person leaving so lingering
+    belongings can escalate AWAY -> FLAGGED -> ILLEGAL.
     Returns (status_list, table_count)."""
-    h, w = image_shape[:2]
     now = time.time()
-
-    chairs = sorted(
-        [d for d in detections if d["class"] in ("chair", "couch")],
-        key=lambda d: d["box"][0],  # stable left-to-right order
-    )
     tables = [d for d in detections if d["class"] == "dining table"]
-
-    if not chairs:
-        return [], len(tables)
-
-    # Convert chair bboxes into Seat objects (padded slightly for person matching)
-    schema_seats = []
-    for i, chair in enumerate(chairs):
-        x1, y1, x2, y2 = chair["box"]
-        pad = 0.2
-        dx, dy = (x2 - x1) * pad, (y2 - y1) * pad
-        nx1 = max(0, x1 - dx) / w
-        ny1 = max(0, y1 - dy) / h
-        nx2 = min(w, x2 + dx) / w
-        ny2 = min(h, y2 + dy) / h
-        schema_seats.append(SchemaSeat(
-            id=f"auto-{i+1}",
-            label=f"Seat {i+1}",
-            zone="main",
-            roi_polygon=[(nx1, ny1), (nx2, ny1), (nx2, ny2), (nx1, ny2)],
-        ))
-
-    # Normalize all detections for the engine
-    schema_dets = [
-        SchemaDetection(
-            bbox=(d["box"][0] / w, d["box"][1] / h, d["box"][2] / w, d["box"][3] / h),
-            confidence=d["confidence"], cls=d["class"], frame_ts=now,
-        )
-        for d in detections
-    ]
-
-    seat_states = occupancy_engine.update(schema_dets, schema_seats, now)
-
-    status_list = []
-    for ss in seat_states:
-        away_sec = None
-        if ss.person_left_ts and ss.status in (Status.AWAY, Status.FLAGGED):
-            away_sec = round(now - ss.person_left_ts)
-        idx = ss.seat_id.split("-")[1]
-        status_list.append({
-            "id": ss.seat_id,
-            "label": f"Seat {idx}",
-            "occupied": ss.status in (Status.OCCUPIED, Status.AWAY, Status.FLAGGED),
-            "has_person": ss.status == Status.OCCUPIED,
-            "coverage": round(ss.confidence, 4),
-            "matched_class": "person" if ss.status == Status.OCCUPIED else None,
-            "person_confidence": round(ss.confidence, 4),
-            "belongings": list(ss.belongings),
-            "state": ss.status.value,
-            "away_seconds": away_sec,
-        })
-
+    status_list = seat_registry.update(detections, image_shape, now, occupancy_engine)
     return status_list, len(tables)
 
 
@@ -385,14 +499,35 @@ def auto_detect_seats(detections, image_shape):
 RELEVANT_CLASSES = {"person", "laptop", "dining table", "chair", "couch",
                      "backpack", "book", "handbag", "suitcase", "cell phone", "bottle"}
 
+MIN_INFERENCE_DIM = 640  # upscale small frames for better detection
+BELONGING_CONF_FLOOR = 0.12  # lower bar for small items (laptop/backpack/etc.)
+PERSON_CONF_FLOOR = 0.40     # higher bar for persons to drop weak ghost boxes
+
 def run_inference(image_bgr, model_name, conf, iou, apply_rois=True):
     model = get_model(model_name)
+
+    # Upscale tiny ESP32-CAM frames so YOLO can actually detect objects
+    h_orig, w_orig = image_bgr.shape[:2]
+    inference_img = image_bgr
+    if max(h_orig, w_orig) < MIN_INFERENCE_DIM:
+        scale = MIN_INFERENCE_DIM / max(h_orig, w_orig)
+        inference_img = cv2.resize(image_bgr, None, fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_LINEAR)
+
+    # Run prediction at the lower of (requested conf, belongings floor) so small
+    # items like laptops can surface; we re-filter per class below.
+    predict_conf = min(conf, BELONGING_CONF_FLOOR)
     t0 = time.perf_counter()
-    results = model.predict(source=image_bgr, conf=conf, iou=iou, verbose=False)
+    results = model.predict(source=inference_img, conf=predict_conf, iou=iou, verbose=False)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     r = results[0]
     names = r.names
+
+    # Scale factor to map detection boxes back to original image
+    h_inf, w_inf = inference_img.shape[:2]
+    sx = w_orig / w_inf
+    sy = h_orig / h_inf
 
     detections, stats = [], {}
     if r.boxes is not None and len(r.boxes) > 0:
@@ -400,15 +535,29 @@ def run_inference(image_bgr, model_name, conf, iou, apply_rois=True):
             cls_id = int(box.cls[0])
             cls_name = names[cls_id]
             confidence = float(box.conf[0])
+            # Per-class threshold: belongings keep the low floor, persons need a
+            # higher bar to drop ghosts, everything else uses the requested conf.
+            if cls_name in BELONGING_CLASSES:
+                min_conf = BELONGING_CONF_FLOOR
+            elif cls_name == "person":
+                min_conf = max(conf, PERSON_CONF_FLOOR)
+            else:
+                min_conf = conf
+            if confidence < min_conf:
+                continue
             xyxy = box.xyxy[0].tolist()
+            # Scale boxes back to original image coordinates
+            scaled_box = [xyxy[0] * sx, xyxy[1] * sy, xyxy[2] * sx, xyxy[3] * sy]
             detections.append({
                 "class": cls_name,
                 "confidence": round(confidence, 4),
-                "box": [round(v, 1) for v in xyxy],
+                "box": [round(v, 1) for v in scaled_box],
             })
             stats[cls_name] = stats.get(cls_name, 0) + 1
 
-    annotated_bgr = image_bgr.copy()
+    # Grayscale the camera frame (3-channel) so colored boxes still render.
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    annotated_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for d in detections:
         if d["class"] not in RELEVANT_CLASSES:
             continue
@@ -421,32 +570,13 @@ def run_inference(image_bgr, model_name, conf, iou, apply_rois=True):
         cv2.putText(annotated_bgr, label, (x1 + 2, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # 座位狀態 — auto-detection first, ROI fallback
+    # 座位狀態 — pure auto-detection from YOLO
     seat_status = []
     rois_used = None
     table_count = 0
-    seat_mode = "none"
+    seat_mode = "auto"
     if apply_rois:
-        has_chairs = any(d["class"] in ("chair", "couch") for d in detections)
-        if has_chairs:
-            # Auto mode — dynamically use detected chairs as seats
-            seat_mode = "auto"
-            seat_status, table_count = auto_detect_seats(detections, image_bgr.shape)
-        else:
-            # Fallback to ROI mode if chairs aren't visible but ROIs exist
-            rois = load_rois()
-            if rois.get("seats"):
-                seat_mode = "roi"
-                h, w = image_bgr.shape[:2]
-                rois_scaled = scaled_rois(rois, w, h)
-                seat_status = compute_seat_status(detections, rois_scaled, image_bgr.shape)
-                annotated_bgr = draw_seat_overlay(annotated_bgr, rois_scaled, seat_status)
-                rois_used = rois_scaled
-                table_count = stats.get("dining table", 0) or 1
-            else:
-                # Nothing — no chairs detected and no ROIs
-                seat_mode = "auto"
-                table_count = stats.get("dining table", 0)
+        seat_status, table_count = auto_detect_seats(detections, image_bgr.shape)
 
     return annotated_bgr, detections, stats, elapsed_ms, seat_status, rois_used, table_count, seat_mode
 
@@ -761,6 +891,23 @@ def api_detect():
         },
         "annotated_image": bgr_to_data_url(annotated_bgr),
     })
+
+
+# ---------- Routes: ESP32-CAM raw frame proxy (fast, no YOLO) ----------
+@app.route("/api/capture-raw", methods=["POST"])
+def api_capture_raw():
+    """Lightweight proxy: fetch frame from ESP32 and return as JPEG. No inference."""
+    body = request.get_json(silent=True) or {}
+    url = body.get("url", "").strip()
+    if not url or not _is_safe_camera_url(url):
+        return b"", 400
+    try:
+        resp = http_requests.get(url, timeout=4)
+        resp.raise_for_status()
+        return resp.content, 200, {"Content-Type": "image/jpeg",
+                                    "Cache-Control": "no-cache"}
+    except Exception:
+        return b"", 502
 
 
 # ---------- Routes: ESP32-CAM capture + detect ----------

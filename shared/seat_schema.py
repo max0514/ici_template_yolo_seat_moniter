@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Status(str, Enum):
@@ -18,6 +18,7 @@ class Status(str, Enum):
     OCCUPIED = "occupied"
     AWAY = "away"
     FLAGGED = "flagged"
+    ILLEGAL = "illegal"
     UNKNOWN = "unknown"
 
 

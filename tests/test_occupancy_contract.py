@@ -152,6 +152,50 @@ def test_flagged_to_empty_when_belongings_removed():
     assert status_of(states) == Status.EMPTY
 
 
+# ---- ILLEGAL transition ---------------------------------------------------
+
+def test_flagged_escalates_to_illegal_after_2x_t_flag():
+    """FLAGGED -> ILLEGAL when away time exceeds 2*T_flag."""
+    eng = OccupancyEngine(k_away=1, T_flag=60.0)
+    eng.update([person_in_roi(0.0)], [SEAT], now=0.0)
+    eng.update([person_in_roi(1.0)], [SEAT], now=1.0)    # OCCUPIED
+    eng.update([laptop_in_roi(2.0)], [SEAT], now=2.0)     # AWAY (k_away=1)
+    eng.update([laptop_in_roi(70.0)], [SEAT], now=70.0)   # FLAGGED (>60s)
+    # Still FLAGGED at t=100 (100s < 2*60=120s since person left at t=1)
+    states = eng.update([laptop_in_roi(100.0)], [SEAT], now=100.0)
+    assert status_of(states) == Status.FLAGGED
+    # Jump past 2*T_flag (person left at t=1, 2*60=120, so t=122 triggers)
+    states = eng.update([laptop_in_roi(122.0)], [SEAT], now=122.0)
+    assert status_of(states) == Status.ILLEGAL
+
+
+def test_illegal_clears_when_person_returns():
+    """ILLEGAL -> OCCUPIED when person comes back (after k_occ frames)."""
+    eng = OccupancyEngine(k_away=1, k_occ=2, T_flag=60.0)
+    eng.update([person_in_roi(0.0)], [SEAT], now=0.0)
+    eng.update([person_in_roi(1.0)], [SEAT], now=1.0)
+    eng.update([laptop_in_roi(2.0)], [SEAT], now=2.0)
+    eng.update([laptop_in_roi(70.0)], [SEAT], now=70.0)
+    eng.update([laptop_in_roi(130.0)], [SEAT], now=130.0)  # ILLEGAL
+    # Person returns
+    eng.update([person_in_roi(131.0), laptop_in_roi(131.0)], [SEAT], now=131.0)
+    states = eng.update([person_in_roi(132.0), laptop_in_roi(132.0)], [SEAT], now=132.0)
+    assert status_of(states) == Status.OCCUPIED
+
+
+def test_illegal_to_empty_when_belongings_removed():
+    """ILLEGAL -> EMPTY when belongings cleared (after k_emp frames)."""
+    eng = OccupancyEngine(k_away=1, k_emp=2, T_flag=60.0, T_empty=0.0)
+    eng.update([person_in_roi(0.0)], [SEAT], now=0.0)
+    eng.update([person_in_roi(1.0)], [SEAT], now=1.0)
+    eng.update([laptop_in_roi(2.0)], [SEAT], now=2.0)
+    eng.update([laptop_in_roi(70.0)], [SEAT], now=70.0)
+    eng.update([laptop_in_roi(130.0)], [SEAT], now=130.0)  # ILLEGAL
+    eng.update([], [SEAT], now=131.0)
+    states = eng.update([], [SEAT], now=132.0)
+    assert status_of(states) == Status.EMPTY
+
+
 # ---- set_flag_threshold ----------------------------------------------------
 
 def test_set_flag_threshold_changes_t_flag():

@@ -120,7 +120,16 @@ body {
 .person-slot[data-state="flagged"] .person-figure svg { opacity: 0.35; }
 .person-slot[data-state="flagged"] .body-fill { fill: var(--flag-red); }
 .person-slot[data-state="flagged"] .body-stroke { stroke: var(--flag-red); }
-.person-slot[data-state="flagged"] .person-figure { animation: flash 1s ease-in-out infinite; }
+.person-slot[data-state="flagged"] .person-figure { animation: flash 1.2s ease-in-out infinite; }
+
+.person-slot[data-state="illegal"] .person-label { color: #ff2222; }
+.person-slot[data-state="illegal"] .person-figure svg { opacity: 0.5; }
+.person-slot[data-state="illegal"] .body-fill { fill: #ff2222; }
+.person-slot[data-state="illegal"] .body-stroke { stroke: #ff2222; }
+.person-slot[data-state="illegal"] .person-figure {
+  animation: flash 0.5s ease-in-out infinite;
+  filter: drop-shadow(0 0 16px rgba(255,34,34,0.5));
+}
 
 .person-slot[data-state="unknown"] .person-label { color: var(--mute); }
 .person-slot[data-state="unknown"] .person-figure svg { opacity: 0.08; }
@@ -146,7 +155,11 @@ body {
 }
 .person-slot[data-state="flagged"] .person-badge {
   color: #fff; background: var(--flag-bg); border: 1px solid var(--flag-border);
-  animation: flash 1s ease-in-out infinite;
+  animation: flash 1.2s ease-in-out infinite;
+}
+.person-slot[data-state="illegal"] .person-badge {
+  color: #fff; background: rgba(255,34,34,0.25); border: 1px solid rgba(255,34,34,0.6);
+  animation: flash 0.5s ease-in-out infinite;
 }
 .person-slot[data-state="unknown"] .person-badge {
   color: var(--mute); background: rgba(61,64,82,0.2); border: 1px solid var(--mute);
@@ -163,6 +176,7 @@ body {
 }
 .person-slot[data-state="away"] .away-timer { color: var(--amber); }
 .person-slot[data-state="flagged"] .away-timer { color: var(--flag-red); }
+.person-slot[data-state="illegal"] .away-timer { color: #ff2222; }
 .belonging-tags { display: flex; gap: 3px; flex-wrap: wrap; justify-content: center; }
 .belonging-tag {
   font-size: 9px; padding: 1px 6px; border-radius: 3px;
@@ -399,7 +413,7 @@ body {
 
 <script>
 const $ = id => document.getElementById(id);
-const defaultCam = new URLSearchParams(location.search).get("cam") || "http://172.20.10.3/capture";
+const defaultCam = new URLSearchParams(location.search).get("cam") || "http://172.20.10.14/capture";
 let liveTimer = null, busy = false, scans = 0;
 let seatSlots = {};  // seat_id -> { slot, badge, timer, belong }
 let prevStates = {};
@@ -448,7 +462,8 @@ const PERSON_SVG = `<svg viewBox="0 0 80 120" fill="none">
 
 const BADGE_TEXT = {
   empty: 'VACANT', occupied: 'OCCUPIED', away: 'AWAY',
-  flagged: '⚠ FLAGGED', unknown: 'NO SIGNAL',
+  flagged: '⚠ SUSPECTED', illegal: '🚨 ILLEGAL',
+  unknown: 'NO SIGNAL',
 };
 
 // Build the scene: tables + seats, dynamically from detection data
@@ -544,7 +559,7 @@ function setSeat(seatData) {
   el.badge.textContent = BADGE_TEXT[state] || state.toUpperCase();
 
   // timer
-  if ((state === 'away' || state === 'flagged') && seatData.away_seconds != null) {
+  if ((state === 'away' || state === 'flagged' || state === 'illegal') && seatData.away_seconds != null) {
     el.timer.textContent = fmtTime(seatData.away_seconds);
   } else {
     el.timer.textContent = '';
@@ -561,8 +576,10 @@ function setSeat(seatData) {
       const itemStr = items.length ? ` (${items.join(', ')})` : '';
       log(`<span class="warn">${escHtml(label)}: person left, belongings remain${itemStr}</span>`);
     } else if (state === 'flagged') {
-      log(`<span class="danger">⚠ ${escHtml(label)}: FLAGGED</span>`);
-    } else if (state === 'occupied' && (prevStates[id] === 'away' || prevStates[id] === 'flagged')) {
+      log(`<span class="danger">⚠ ${escHtml(label)}: SUSPECTED ILLEGAL OCCUPATION</span>`);
+    } else if (state === 'illegal') {
+      log(`<span class="danger">🚨 ${escHtml(label)}: ILLEGAL OCCUPATION CONFIRMED</span>`);
+    } else if (state === 'occupied' && (prevStates[id] === 'away' || prevStates[id] === 'flagged' || prevStates[id] === 'illegal')) {
       log(`<span class="hi">${escHtml(label)}: person returned</span>`);
     } else if (state === 'empty' && prevStates[id] && prevStates[id] !== 'empty') {
       log(`<span class="hi">${escHtml(label)}: now vacant</span>`);
@@ -572,12 +589,26 @@ function setSeat(seatData) {
 }
 
 function updateBanner(statuses) {
-  const occ = statuses.filter(s => s.state !== 'empty' && s.state !== 'unknown').length;
+  const occ = statuses.filter(s => s.state === 'occupied').length;
   const el = $('banner-count');
   el.textContent = `${occ} / ${totalSeats}`;
   el.classList.remove('none','some','full');
   el.classList.add(occ === 0 ? 'none' : occ >= totalSeats ? 'full' : 'some');
-  $('flag-alert').classList.toggle('show', statuses.some(s => s.state === 'flagged'));
+  const hasIllegal = statuses.some(s => s.state === 'illegal');
+  const hasFlagged = statuses.some(s => s.state === 'flagged');
+  const alertEl = $('flag-alert');
+  alertEl.classList.toggle('show', hasFlagged || hasIllegal);
+  if (hasIllegal) {
+    alertEl.textContent = '🚨 ILLEGAL OCCUPATION DETECTED';
+    alertEl.style.borderColor = 'rgba(255,34,34,0.6)';
+    alertEl.style.background = 'rgba(255,34,34,0.15)';
+    alertEl.style.color = '#ff2222';
+  } else if (hasFlagged) {
+    alertEl.textContent = '⚠ SUSPECTED ILLEGAL OCCUPATION';
+    alertEl.style.borderColor = '';
+    alertEl.style.background = '';
+    alertEl.style.color = '';
+  }
 }
 
 // Camera
@@ -633,19 +664,60 @@ async function capture(silent) {
   }
 }
 
+// ── Fast raw frame display (no YOLO) ──
+let rawBusy = false;
+async function fetchRawFrame() {
+  if (rawBusy) return;
+  const url = getCamURL();
+  if (!url) return;
+  rawBusy = true;
+  try {
+    const res = await fetch('/api/capture-raw', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url}),
+    });
+    if (!res.ok) throw new Error();
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const img = $('cam-img');
+    const prev = img.src;
+    img.src = objUrl;
+    img.style.display = 'block';
+    $('cam-ph').style.display = 'none';
+    // free previous blob URL
+    if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+    $('status-dot').className = 'dot live';
+  } catch (e) {
+    // silent — inference loop handles errors
+  } finally {
+    rawBusy = false;
+  }
+}
+
+// ── Live mode: every frame goes through YOLO ──
+let liveLoopId = null;
+
 $('btn-snap').onclick = () => capture(false);
 $('btn-live').onclick = () => {
   if (liveTimer) return;
   log('Live started');
-  const tick = () => { if (!busy) capture(true); };
+
+  async function tick() {
+    if (!liveTimer) return;
+    await capture(true);
+    if (liveTimer) liveLoopId = requestAnimationFrame(() => tick());
+  }
+  liveTimer = true;
   tick();
-  liveTimer = setInterval(tick, 50);
+
   $('btn-live').disabled = true;
   $('btn-live').classList.add('active');
   $('btn-stop').disabled = false;
 };
 $('btn-stop').onclick = () => {
-  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  if (liveLoopId) { cancelAnimationFrame(liveLoopId); liveLoopId = null; }
+  liveTimer = null;
   log('Live stopped');
   $('btn-live').disabled = false;
   $('btn-live').classList.remove('active');
