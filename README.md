@@ -153,3 +153,18 @@ presentation.
   suggestion, and feedback throughout the semester.
 
 ## References
+
+1. Jocher, G., Chaurasia, A., & Qiu, J. (2023). *Ultralytics YOLOv8* (Version
+   8.0.0) [Computer software]. https://github.com/ultralytics/ultralytics
+2. Redmon, J., Divvala, S., Girshick, R., & Farhadi, A. (2016). You Only Look
+   Once: Unified, Real-Time Object Detection. *Proceedings of the IEEE
+   Conference on Computer Vision and Pattern Recognition (CVPR)*, 779–788.
+3. Bradski, G. (2000). The OpenCV Library. *Dr. Dobb's Journal of Software
+   Tools*. https://opencv.org
+4. Pallets Projects. (2010). *Flask: A lightweight WSGI web application
+   framework* [Computer software]. https://flask.palletsprojects.com
+5. Espressif Systems. (2023). *ESP32-CAM Development Board — Technical
+   Reference Manual*. https://www.espressif.com
+6. SQLite Consortium. *SQLite Documentation*. https://www.sqlite.org/docs.html
+7. Harris, C. R., et al. (2020). Array programming with NumPy. *Nature*, 585,
+   357–362. https://doi.org/10.1038/s41586-020-2649-2
